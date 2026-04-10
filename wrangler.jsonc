@@ -16,6 +16,14 @@
 	"upload_source_maps": true,
 	"compatibility_flags": [
 		"nodejs_compat"
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "sandbox-perf-results",
+			"database_id": "293e53bf-a280-49d2-a006-02c383814391",
+			"remote": true
+		}
 	]
 	/**
 	 * Smart Placement
