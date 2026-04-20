@@ -1,0 +1,13 @@
+# Secret token used to authenticate POST /api/notify requests.
+# Must match the NOTIFY_SECRET GitHub Actions secret so only CI can trigger notifications.
+# Generate with: openssl rand -hex 32
+NOTIFY_SECRET=
+
+# Google Chat incoming webhook URL to post run reports to.
+# Create one via: Google Chat space → Apps & integrations → Webhooks.
+GOOGLE_CHAT_WEBHOOK_URL=
+
+# Full URL of the BenchBox dashboard (e.g. http://localhost:5173 locally).
+# Used as the "View Full Dashboard" link in Google Chat notifications.
+# In production this is set as a var in wrangler.jsonc — only override here for local dev.
+DASHBOARD_URL=

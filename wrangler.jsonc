@@ -24,7 +24,7 @@
 			"database_id": "293e53bf-a280-49d2-a006-02c383814391",
 			"remote": true
 		}
-	]
+	],
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -42,7 +42,9 @@
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
 	 */
-	// "vars": {  "MY_VARIABLE": "production_value" }
+	"vars": {
+		"DASHBOARD_URL": "https://benchbox.agents-b8a.workers.dev/"
+	}
 	/**
 	 * Service Bindings (communicate between multiple Workers)
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
