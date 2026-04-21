@@ -455,7 +455,8 @@ export default {
     }
 
     const url = new URL(request.url);
-    const { pathname, searchParams } = url;
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
+    const { searchParams } = url;
 
     if (!pathname.startsWith("/api/")) {
       return new Response(null, { status: 404 });
