@@ -7,6 +7,9 @@ import { TrendChart } from "./components/TrendChart";
 import { PercentilesChart } from "./components/PercentilesChart";
 import { RunsTable } from "./components/RunsTable";
 import { RunDetail } from "./components/RunDetail";
+import { ScenarioNav } from "./components/ScenarioNav";
+import { ScenarioDashboard } from "./components/ScenarioDashboard";
+import { SCENARIOS } from "./scenarios";
 import {
   type Filters,
   type PerfRun,
@@ -39,6 +42,7 @@ function App() {
   const [filters, setFilters] = useState<Filters>(DEFAULT_FILTERS);
   const [selectedRun, setSelectedRun] = useState<PerfRun | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [activeScenario, setActiveScenario] = useState<string | null>(null);
 
   const handleFiltersChange = useCallback((partial: Partial<Filters>) => {
     setFilters((prev) => ({ ...prev, ...partial }));
@@ -122,41 +126,73 @@ function App() {
     return trendData[0].unit ?? "";
   }, [trendData, scenarios, filters.scenario, filters.metric]);
 
+  const activeScenarioDef = activeScenario
+    ? (SCENARIOS.find((s) => s.id === activeScenario) ?? null)
+    : null;
+
   return (
     <div className="min-h-screen bg-cf-navy flex flex-col">
       <Header onRefresh={handleRefresh} refreshing={anyLoading} />
+
+      <ScenarioNav
+        scenarios={SCENARIOS}
+        active={activeScenario}
+        onChange={setActiveScenario}
+      />
 
       <FilterBar
         filters={filters}
         onChange={handleFiltersChange}
         scenarios={scenarios ?? []}
         filterOptions={filterOptions}
+        hideMetricPickers={activeScenario !== null}
       />
 
-      <main className="flex-1 px-6 py-6 space-y-6 max-w-screen-2xl mx-auto w-full">
-        <SummaryCards data={summary} loading={summaryLoading} />
+      <main className="flex-1 px-6 py-6 max-w-screen-2xl mx-auto w-full">
+        {activeScenarioDef ? (
+          <div className="space-y-2">
+            <div className="mb-6">
+              <h2 className="text-cf-text font-semibold text-lg">
+                {activeScenarioDef.label}
+              </h2>
+              <p className="text-cf-muted text-sm mt-0.5">
+                {activeScenarioDef.description}
+              </p>
+            </div>
+            <ScenarioDashboard
+              scenario={activeScenarioDef}
+              latestMetrics={percentilesMetrics}
+              branch={filters.branch}
+              refreshKey={refreshKey}
+            />
+          </div>
+        ) : (
+          <div className="space-y-6">
+            <SummaryCards data={summary} loading={summaryLoading} />
 
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-          <TrendChart
-            data={trendData}
-            loading={trendLoading}
-            unit={trendUnit}
-            scenario={filters.scenario}
-            metric={filters.metric}
-          />
-          <PercentilesChart
-            metrics={percentilesMetrics}
-            loading={runsLoading}
-            scenario={filters.scenario}
-            metric={filters.metric}
-          />
-        </div>
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <TrendChart
+                data={trendData}
+                loading={trendLoading}
+                unit={trendUnit}
+                scenario={filters.scenario}
+                metric={filters.metric}
+              />
+              <PercentilesChart
+                metrics={percentilesMetrics}
+                loading={runsLoading}
+                scenario={filters.scenario}
+                metric={filters.metric}
+              />
+            </div>
 
-        <RunsTable
-          runs={runs}
-          loading={runsLoading}
-          onSelectRun={setSelectedRun}
-        />
+            <RunsTable
+              runs={runs}
+              loading={runsLoading}
+              onSelectRun={setSelectedRun}
+            />
+          </div>
+        )}
       </main>
 
       <footer className="border-t border-cf-border px-6 py-3 text-center">
