@@ -29,7 +29,6 @@ const BACKUP_GROUPS = [
   { key: "create", label: "Create", color: "#F48120" },
   { key: "restore", label: "Restore", color: "#6366f1" },
 ];
-const BACKUP_SIZES = ["Small", "Medium", "Large"];
 
 function SkeletonCard() {
   return (
@@ -253,10 +252,15 @@ function BackupRestoreLayout({
 }) {
   const sizedData = data.filter((d) => d.metric.group !== "after");
   const afterData = data.filter((d) => d.metric.group === "after");
+  const sizes = [
+    ...new Set(
+      sizedData.map((d) => d.metric.size).filter((s): s is string => s != null),
+    ),
+  ];
 
   return (
     <div className="space-y-8">
-      {BACKUP_SIZES.map((size) => {
+      {sizes.map((size) => {
         const sizeData = sizedData.filter((d) => d.metric.size === size);
         if (sizeData.length === 0) return null;
         return (
@@ -283,7 +287,7 @@ function BackupRestoreLayout({
           title="Create vs Restore Latency"
           unit={unit}
           groups={BACKUP_GROUPS}
-          sizes={BACKUP_SIZES}
+          sizes={sizes}
         />
       </div>
 
