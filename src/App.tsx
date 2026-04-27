@@ -30,7 +30,7 @@ function buildQuery(base: string, params: Record<string, string>): string {
 }
 
 const DEFAULT_FILTERS: Filters = {
-  branch: "",
+  branch: "main",
   trigger: "",
   from: "",
   to: "",

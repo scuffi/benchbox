@@ -161,7 +161,7 @@ export function FilterBar({
           </>
         )}
 
-        {(filters.branch ||
+        {(filters.branch !== "main" ||
           filters.trigger ||
           filters.from ||
           filters.to ||
@@ -169,7 +169,7 @@ export function FilterBar({
           <button
             onClick={() =>
               onChange({
-                branch: "",
+                branch: "main",
                 trigger: "",
                 from: "",
                 to: "",
