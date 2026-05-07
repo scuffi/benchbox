@@ -678,6 +678,13 @@ export default {
           );
         }
 
+        if (summary.run.branch !== "main") {
+          return json({
+            skipped: true,
+            reason: `Webhook suppressed for non-main branch "${summary.run.branch ?? "unknown"}"`,
+          });
+        }
+
         const message = buildGoogleChatMessage(summary, env.DASHBOARD_URL);
         const gchatResp = await fetch(env.GOOGLE_CHAT_WEBHOOK_URL, {
           method: "POST",

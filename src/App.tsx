@@ -172,7 +172,12 @@ function App() {
 
       <footer className="border-t border-cf-border px-6 py-3 text-center">
         <span className="text-cf-muted text-xs">
-          BenchBox · Cloudflare Workers + D1 · {new Date().getFullYear()}
+          <a
+            href="https://github.com/cloudflare/sandbox-sdk"
+            className="text-cf-muted hover:text-cf-text transition-colors"
+          >
+            BenchBox · Cloudflare sandbox-sdk · {new Date().getFullYear()}
+          </a>
         </span>
       </footer>
 
