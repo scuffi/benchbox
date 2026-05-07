@@ -246,6 +246,15 @@ function metricWidget(r: MetricChange, valueHtml: string, sub: string): object {
   };
 }
 
+function collapsibleSection(header: string, widgets: object[]): object {
+  return {
+    header,
+    collapsible: true,
+    uncollapsibleWidgetsCount: 0,
+    widgets,
+  };
+}
+
 function buildGoogleChatMessage(
   summary: RunSummary,
   dashboardUrl: string,
@@ -374,18 +383,20 @@ function buildGoogleChatMessage(
 
   // --- Section 5: Short-term improvements (conditional) ---
   if (shortTermImprovements.length > 0) {
-    sections.push({
-      header: `🟢 Short-term Improvements (${shortTermImprovements.length}) — sudden drop`,
-      widgets: shortTermImprovements
-        .slice(0, 10)
-        .map((imp) =>
-          metricWidget(
-            imp,
-            `<font color="#137333">${fmtNum(imp.historicalMean, imp.unit)} → <b>${fmtNum(imp.current, imp.unit)}</b></font>`,
-            `z=${imp.zScore.toFixed(2)}σ · ${fmtPct(imp.pctChange)} · ${imp.sampleCount} samples`,
+    sections.push(
+      collapsibleSection(
+        `🟢 Short-term Improvements (${shortTermImprovements.length}) — sudden drop`,
+        shortTermImprovements
+          .slice(0, 10)
+          .map((imp) =>
+            metricWidget(
+              imp,
+              `<font color="#137333">${fmtNum(imp.historicalMean, imp.unit)} → <b>${fmtNum(imp.current, imp.unit)}</b></font>`,
+              `z=${imp.zScore.toFixed(2)}σ · ${fmtPct(imp.pctChange)} · ${imp.sampleCount} samples`,
+            ),
           ),
-        ),
-    });
+      ),
+    );
   }
 
   // --- Section 6: Long-term regression trends (conditional) ---
@@ -406,21 +417,22 @@ function buildGoogleChatMessage(
 
   // --- Section 7: Long-term improvement trends (conditional) ---
   if (longTermImprovements.length > 0) {
-    sections.push({
-      header: `📉 Long-term Improvement Trends (${longTermImprovements.length}) — gradual decrease`,
-      widgets: longTermImprovements
-        .slice(0, 10)
-        .map((imp) =>
-          metricWidget(
-            imp,
-            `<font color="#137333"><b>${(imp.slopePctPerRun * 100).toFixed(2)}%/run</b></font>`,
-            `mean ${fmtNum(imp.historicalMean, imp.unit)} · ${imp.sampleCount} samples`,
+    sections.push(
+      collapsibleSection(
+        `📉 Long-term Improvement Trends (${longTermImprovements.length}) — gradual decrease`,
+        longTermImprovements
+          .slice(0, 10)
+          .map((imp) =>
+            metricWidget(
+              imp,
+              `<font color="#137333"><b>${(imp.slopePctPerRun * 100).toFixed(2)}%/run</b></font>`,
+              `mean ${fmtNum(imp.historicalMean, imp.unit)} · ${imp.sampleCount} samples`,
+            ),
           ),
-        ),
-    });
+      ),
+    );
   }
 
-  // --- Section 8: Dashboard link ---
   sections.push({
     widgets: [
       {
