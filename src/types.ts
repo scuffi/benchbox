@@ -72,6 +72,30 @@ export interface RunDetailResponse {
   metrics: PerfMetric[];
 }
 
+export interface MetricChange {
+  scenario: string;
+  metric_name: string;
+  unit: string | null;
+  current: number;
+  historicalMean: number;
+  pctChange: number;
+  zScore: number;
+  slopePerRun: number;
+  slopePctPerRun: number;
+  sampleCount: number;
+}
+
+export interface RunAnalysis {
+  run: PerfRun;
+  metrics: PerfMetric[];
+  failures: MetricChange[];
+  shortTermRegressions: MetricChange[];
+  shortTermImprovements: MetricChange[];
+  longTermRegressions: MetricChange[];
+  longTermImprovements: MetricChange[];
+  historyRunCount: number;
+}
+
 export interface Filters {
   branch: string;
   trigger: string;

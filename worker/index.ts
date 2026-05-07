@@ -633,6 +633,18 @@ export default {
         });
       }
 
+      // GET /api/analysis — run summary with regression/improvement analysis
+      if (pathname === "/api/analysis" && request.method === "GET") {
+        const runId = searchParams.get("run_id") ?? undefined;
+        const summary = await buildRunSummary(env, runId);
+        if (!summary)
+          return json(
+            { error: runId ? `Run ${runId} not found` : "No runs found" },
+            404,
+          );
+        return json(summary);
+      }
+
       // POST /api/notify — analyse latest (or given) run and post to Google Chat
       if (pathname === "/api/notify" && request.method === "POST") {
         const authHeader = request.headers.get("Authorization");

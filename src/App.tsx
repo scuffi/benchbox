@@ -1,23 +1,20 @@
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useEffect } from "react";
 import { useApi } from "./hooks/useApi";
 import { Header } from "./components/Header";
 import { FilterBar } from "./components/FilterBar";
 import { SummaryCards } from "./components/SummaryCards";
-import { TrendChart } from "./components/TrendChart";
-import { PercentilesChart } from "./components/PercentilesChart";
 import { RunsTable } from "./components/RunsTable";
 import { RunDetail } from "./components/RunDetail";
-import { ScenarioNav } from "./components/ScenarioNav";
 import { ScenarioDashboard } from "./components/ScenarioDashboard";
+import { LatestRunAnalysis } from "./components/LatestRunAnalysis";
 import { SCENARIOS } from "./scenarios";
 import {
   type Filters,
   type PerfRun,
   type SummaryResponse,
   type FiltersResponse,
-  type ScenarioCombo,
-  type TrendPoint,
   type RunDetailResponse,
+  type RunAnalysis,
 } from "./types";
 
 function buildQuery(base: string, params: Record<string, string>): string {
@@ -43,6 +40,23 @@ function App() {
   const [selectedRun, setSelectedRun] = useState<PerfRun | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [activeScenario, setActiveScenario] = useState<string | null>(null);
+  const [theme, setTheme] = useState<"dark" | "light">(() => {
+    const saved = localStorage.getItem("cf-theme");
+    if (saved === "light" || saved === "dark") return saved;
+    return "dark";
+  });
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("light", theme === "light");
+  }, [theme]);
+
+  const handleThemeToggle = useCallback(() => {
+    setTheme((t) => {
+      const next = t === "dark" ? "light" : "dark";
+      localStorage.setItem("cf-theme", next);
+      return next;
+    });
+  }, []);
 
   const handleFiltersChange = useCallback((partial: Partial<Filters>) => {
     setFilters((prev) => ({ ...prev, ...partial }));
@@ -62,50 +76,32 @@ function App() {
     [filters.branch, filters.trigger, filters.from, filters.to, refreshKey],
   );
 
-  const trendUrl = useMemo(() => {
-    if (!filters.scenario || !filters.metric) return null;
-    return buildQuery("/api/trend", {
-      scenario: filters.scenario,
-      metric: filters.metric,
-      branch: filters.branch,
-      from: filters.from,
-      to: filters.to,
-      _k: String(refreshKey),
-    });
-  }, [filters, refreshKey]);
-
   const summaryUrl = useMemo(
     () => buildQuery("/api/summary", { _k: String(refreshKey) }),
-    [refreshKey],
-  );
-  const scenariosUrl = useMemo(
-    () => buildQuery("/api/scenarios", { _k: String(refreshKey) }),
     [refreshKey],
   );
   const filtersUrl = useMemo(
     () => buildQuery("/api/filters", { _k: String(refreshKey) }),
     [refreshKey],
   );
+  const analysisUrl = useMemo(
+    () => buildQuery("/api/analysis", { _k: String(refreshKey) }),
+    [refreshKey],
+  );
 
   const { data: runs, loading: runsLoading } = useApi<PerfRun[]>(runsUrl);
   const { data: summary, loading: summaryLoading } =
     useApi<SummaryResponse>(summaryUrl);
-  const { data: scenarios } = useApi<ScenarioCombo[]>(scenariosUrl);
   const { data: filterOptions } = useApi<FiltersResponse>(filtersUrl);
-  const { data: trendData, loading: trendLoading } =
-    useApi<TrendPoint[]>(trendUrl);
+  const { data: analysis, loading: analysisLoading } =
+    useApi<RunAnalysis>(analysisUrl);
 
-  const latestRunMetrics = useMemo(() => {
-    if (!runs || runs.length === 0) return null;
-    return runs[0];
-  }, [runs]);
-
-  const anyLoading = runsLoading || summaryLoading;
+  const anyLoading = runsLoading || summaryLoading || analysisLoading;
 
   const latestRunMetricsUrl = useMemo(() => {
-    if (!latestRunMetrics) return null;
-    return `/api/runs/${latestRunMetrics.run_id}`;
-  }, [latestRunMetrics]);
+    if (!analysis) return null;
+    return `/api/runs/${analysis.run.run_id}`;
+  }, [analysis]);
 
   const { data: latestRunDetail } =
     useApi<RunDetailResponse>(latestRunMetricsUrl);
@@ -114,38 +110,27 @@ function App() {
     return latestRunDetail?.metrics ?? null;
   }, [latestRunDetail]);
 
-  const trendUnit = useMemo(() => {
-    if (!trendData || trendData.length === 0) {
-      return (
-        scenarios?.find(
-          (s) =>
-            s.scenario === filters.scenario && s.metric_name === filters.metric,
-        )?.unit ?? ""
-      );
-    }
-    return trendData[0].unit ?? "";
-  }, [trendData, scenarios, filters.scenario, filters.metric]);
-
   const activeScenarioDef = activeScenario
     ? (SCENARIOS.find((s) => s.id === activeScenario) ?? null)
     : null;
 
   return (
     <div className="min-h-screen bg-cf-navy flex flex-col">
-      <Header onRefresh={handleRefresh} refreshing={anyLoading} />
-
-      <ScenarioNav
+      <Header
+        onRefresh={handleRefresh}
+        refreshing={anyLoading}
         scenarios={SCENARIOS}
-        active={activeScenario}
-        onChange={setActiveScenario}
+        activeScenario={activeScenario}
+        onScenarioChange={setActiveScenario}
+        theme={theme}
+        onThemeToggle={handleThemeToggle}
       />
 
       <FilterBar
         filters={filters}
         onChange={handleFiltersChange}
-        scenarios={scenarios ?? []}
         filterOptions={filterOptions}
-        hideMetricPickers={activeScenario !== null}
+        hideMetricPickers={true}
       />
 
       <main className="flex-1 px-6 py-6 max-w-screen-2xl mx-auto w-full">
@@ -168,23 +153,13 @@ function App() {
           </div>
         ) : (
           <div className="space-y-6">
-            <SummaryCards data={summary} loading={summaryLoading} />
+            <SummaryCards
+              data={summary}
+              analysis={analysis}
+              loading={summaryLoading || analysisLoading}
+            />
 
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-              <TrendChart
-                data={trendData}
-                loading={trendLoading}
-                unit={trendUnit}
-                scenario={filters.scenario}
-                metric={filters.metric}
-              />
-              <PercentilesChart
-                metrics={percentilesMetrics}
-                loading={runsLoading}
-                scenario={filters.scenario}
-                metric={filters.metric}
-              />
-            </div>
+            <LatestRunAnalysis data={analysis} loading={analysisLoading} />
 
             <RunsTable
               runs={runs}
