@@ -353,32 +353,36 @@ function buildGoogleChatMessage(
 
   // --- Section 3: Direct failures (conditional, highest priority) ---
   if (failures.length > 0) {
-    sections.push({
-      header: `🚨 Direct Failures (${failures.length}) — count/percent dropped`,
-      widgets: failures.map((f) =>
-        metricWidget(
-          f,
-          `<font color="#a50e0e">${fmtNum(f.historicalMean, f.unit)} → <b>${fmtNum(f.current, f.unit)}</b></font>`,
-          `${fmtPct(f.pctChange)} · ${f.sampleCount} samples`,
+    sections.push(
+      collapsibleSection(
+        `🚨 Direct Failures (${failures.length}) — count/percent dropped`,
+        failures.map((f) =>
+          metricWidget(
+            f,
+            `<font color="#a50e0e">${fmtNum(f.historicalMean, f.unit)} → <b>${fmtNum(f.current, f.unit)}</b></font>`,
+            `${fmtPct(f.pctChange)} · ${f.sampleCount} samples`,
+          ),
         ),
       ),
-    });
+    );
   }
 
   // --- Section 4: Short-term regressions (conditional) ---
   if (shortTermRegressions.length > 0) {
-    sections.push({
-      header: `🔴 Short-term Regressions (${shortTermRegressions.length}) — sudden spike`,
-      widgets: shortTermRegressions
-        .slice(0, 10)
-        .map((r) =>
-          metricWidget(
-            r,
-            `<font color="#d93025">${fmtNum(r.historicalMean, r.unit)} → <b>${fmtNum(r.current, r.unit)}</b></font>`,
-            `z=${r.zScore.toFixed(2)}σ · ${fmtPct(r.pctChange)} · ${r.sampleCount} samples`,
+    sections.push(
+      collapsibleSection(
+        `🔴 Short-term Regressions (${shortTermRegressions.length}) — sudden spike`,
+        shortTermRegressions
+          .slice(0, 10)
+          .map((r) =>
+            metricWidget(
+              r,
+              `<font color="#d93025">${fmtNum(r.historicalMean, r.unit)} → <b>${fmtNum(r.current, r.unit)}</b></font>`,
+              `z=${r.zScore.toFixed(2)}σ · ${fmtPct(r.pctChange)} · ${r.sampleCount} samples`,
+            ),
           ),
-        ),
-    });
+      ),
+    );
   }
 
   // --- Section 5: Short-term improvements (conditional) ---
@@ -401,18 +405,20 @@ function buildGoogleChatMessage(
 
   // --- Section 6: Long-term regression trends (conditional) ---
   if (longTermRegressions.length > 0) {
-    sections.push({
-      header: `📈 Long-term Regression Trends (${longTermRegressions.length}) — gradual increase`,
-      widgets: longTermRegressions
-        .slice(0, 10)
-        .map((r) =>
-          metricWidget(
-            r,
-            `<font color="#e37400"><b>+${(r.slopePctPerRun * 100).toFixed(2)}%/run</b></font>`,
-            `mean ${fmtNum(r.historicalMean, r.unit)} · ${r.sampleCount} samples`,
+    sections.push(
+      collapsibleSection(
+        `📈 Long-term Regression Trends (${longTermRegressions.length}) — gradual increase`,
+        longTermRegressions
+          .slice(0, 10)
+          .map((r) =>
+            metricWidget(
+              r,
+              `<font color="#e37400"><b>+${(r.slopePctPerRun * 100).toFixed(2)}%/run</b></font>`,
+              `mean ${fmtNum(r.historicalMean, r.unit)} · ${r.sampleCount} samples`,
+            ),
           ),
-        ),
-    });
+      ),
+    );
   }
 
   // --- Section 7: Long-term improvement trends (conditional) ---
