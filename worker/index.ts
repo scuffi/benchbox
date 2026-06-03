@@ -4,6 +4,10 @@ import {
   zScore as ssZScore,
   linearRegression,
 } from "simple-statistics";
+import { Think } from "@cloudflare/think";
+import { createWorkersAI } from "workers-ai-provider";
+import { tool, generateText, stepCountIs } from "ai";
+import { z } from "zod";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -86,6 +90,664 @@ interface AIInsights {
   headline: string;
   topIssues: AIInsight[];
   justification: string;
+}
+
+interface InvestigationSignal {
+  scenario: string;
+  metric: string;
+  unit: string | null;
+  historical_baseline_mean: string;
+  previous_run_mean: string | null;
+  current: string;
+  baseline_pct_change: string;
+  z: string;
+  slope: string;
+}
+
+interface InvestigationRequest {
+  currentRun: {
+    runId: string;
+    commit: string | null;
+    sdkVersion: string | null;
+  };
+  previousRun: {
+    runId: string | null;
+    commit: string | null;
+    sdkVersion: string | null;
+  };
+  commit_changed: boolean;
+  sdk_version_changed: boolean;
+  signals: InvestigationSignal[];
+}
+
+interface SDKInvestigation {
+  verdict: "genuine" | "flaky" | "inconclusive";
+  confidence: "low" | "medium" | "high";
+  summary: string;
+  evidence: string[];
+  changedFiles: string[];
+}
+
+function isSandboxSDKPath(value: string): boolean {
+  if (!value.includes("/")) return false;
+  if (/^path\d*$/i.test(value)) return false;
+  if (!/^[a-zA-Z0-9._/-]+$/.test(value)) return false;
+  // Exclude CI, config, and documentation files — only source/test code is relevant
+  if (/^\.(github|agents|changeset)\//i.test(value)) return false;
+  if (/\.(yml|yaml|md|json|lock|toml)$/i.test(value)) return false;
+  if (/^(Dockerfile|docker-compose|DOCKER)/i.test(value.split("/").pop() ?? ""))
+    return false;
+  return true;
+}
+
+function sandboxSDKFileUrl(commit: string, path: string): string {
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  return `https://github.com/cloudflare/sandbox-sdk/blob/${commit}/${encodedPath}`;
+}
+
+export class SandboxSDKInvestigator extends Think<Env> {
+  maxSteps = 200;
+
+  private githubHeaders() {
+    return {
+      Accept: "application/vnd.github+json",
+      "User-Agent": "benchbox-sandbox-sdk-investigator",
+      "X-GitHub-Api-Version": "2022-11-28",
+    };
+  }
+
+  private async githubJson<T>(path: string): Promise<T | null> {
+    const response = await fetch(`https://api.github.com${path}`, {
+      headers: this.githubHeaders(),
+    });
+    if (!response.ok) return null;
+    return (await response.json()) as T;
+  }
+
+  private async sandboxSDKTree(commit: string) {
+    const tree = await this.githubJson<{
+      tree?: Array<{
+        path: string;
+        type: "blob" | "tree" | "commit";
+        size?: number;
+      }>;
+    }>(`/repos/cloudflare/sandbox-sdk/git/trees/${commit}?recursive=1`);
+    return tree?.tree ?? [];
+  }
+
+  getModel() {
+    const gatewayId = this.env.AI_GATEWAY_ID;
+    const provider = createWorkersAI({
+      binding: this.env.AI,
+      ...(gatewayId ? { gateway: { id: gatewayId } } : {}),
+    });
+    return provider("@cf/moonshotai/kimi-k2.6");
+  }
+
+  getSystemPrompt() {
+    return `You are a Project Think diagnosis agent for Cloudflare's public sandbox-sdk repo.
+Your job is to inspect recent sandbox-sdk code changes and benchmark signals, then produce a cautious diagnosis.
+Do not fix code. Do not suggest patches. Do not overstate causality.
+Use tools to inspect GitHub compare data, commit metadata, repo paths, targeted code references, and relevant files before answering.
+Do not stop after one search. Build a small research plan, then investigate every benchmark signal or scenario group in the input.
+At minimum, compare the commits, inspect both commit metadata entries, review changed files, search for code related to each affected scenario, and fetch targeted files when search results look relevant.
+Keep researching until you have either a plausible evidence-backed hypothesis or you have exhausted changed files, scenario keyword searches, and related issue/PR searches.
+IMPORTANT: A Dockerfile base image bump (e.g. FROM cloudflare/sandbox:0.10.x to 0.11.x) is just the SDK release version marker — it does NOT by itself cause benchmark regressions. If the only diff is a Dockerfile bump with no source code changes, call getHistoricalBenchmarkMetrics for each affected signal to check whether the metric is inherently noisy before concluding.
+When no source code change clearly explains the regression, call getHistoricalBenchmarkMetrics to check variance. CV>0.10 = high variance = likely flaky.
+Prefer targeted search tools over fetching large files. Keep the final diagnosis evidence-backed and compact.
+Return ONLY valid JSON:
+{"verdict":"genuine"|"flaky"|"inconclusive","confidence":"low"|"medium"|"high","summary":"<≤240 chars>","evidence":["<≤160 chars>"],"changedFiles":["<path>"]}
+verdict=genuine: a specific source code change plausibly explains the regression
+verdict=flaky: no meaningful source change correlates, OR getHistoricalBenchmarkMetrics shows high variance (CV>0.10)
+verdict=inconclusive: changes present but causal link is unclear
+For changedFiles, include only real repository paths observed in tool results. Never output placeholders.
+In summary and evidence strings, use <b> tags around key values: file names, commit hashes, SDK versions, function names, and any numbers that matter.`;
+  }
+
+  getTools() {
+    return {
+      compareSandboxSDKCommits: tool({
+        description:
+          "Compare two commits in cloudflare/sandbox-sdk using the public GitHub API.",
+        inputSchema: z.object({
+          base: z.string(),
+          head: z.string(),
+        }),
+        execute: async ({ base, head }) => {
+          const response = await fetch(
+            `https://api.github.com/repos/cloudflare/sandbox-sdk/compare/${base}...${head}`,
+            {
+              headers: {
+                Accept: "application/vnd.github+json",
+                "User-Agent": "benchbox-sandbox-sdk-investigator",
+                "X-GitHub-Api-Version": "2022-11-28",
+              },
+            },
+          );
+          if (!response.ok) {
+            return {
+              ok: false,
+              status: response.status,
+              error: await response.text(),
+            };
+          }
+          const data = (await response.json()) as {
+            status: string;
+            total_commits: number;
+            files?: Array<{
+              filename: string;
+              status: string;
+              additions: number;
+              deletions: number;
+              patch?: string;
+            }>;
+          };
+          return {
+            ok: true,
+            status: data.status,
+            total_commits: data.total_commits,
+            files: (data.files ?? []).slice(0, 30).map((file) => ({
+              filename: file.filename,
+              status: file.status,
+              additions: file.additions,
+              deletions: file.deletions,
+              // Include patch for source files so the agent can see what actually changed
+              ...(file.patch &&
+              /\.(ts|js|py|go|rs|sh)$/.test(file.filename) &&
+              !/^\.(github|agents)\//i.test(file.filename)
+                ? { patch: file.patch.slice(0, 400) }
+                : {}),
+            })),
+          };
+        },
+      }),
+      fetchSandboxSDKFile: tool({
+        description:
+          "Fetch a file from cloudflare/sandbox-sdk at a specific commit SHA.",
+        inputSchema: z.object({
+          commit: z.string(),
+          path: z.string(),
+        }),
+        execute: async ({ commit, path }) => {
+          const response = await fetch(
+            `https://raw.githubusercontent.com/cloudflare/sandbox-sdk/${commit}/${path}`,
+            {
+              headers: {
+                "User-Agent": "benchbox-sandbox-sdk-investigator",
+              },
+            },
+          );
+          if (!response.ok) {
+            return { ok: false, status: response.status };
+          }
+          return {
+            ok: true,
+            path,
+            content: (await response.text()).slice(0, 5000),
+          };
+        },
+      }),
+      getSandboxSDKCommit: tool({
+        description:
+          "Fetch commit metadata for a cloudflare/sandbox-sdk commit SHA.",
+        inputSchema: z.object({
+          commit: z.string(),
+        }),
+        execute: async ({ commit }) => {
+          const data = await this.githubJson<{
+            sha: string;
+            commit?: {
+              message?: string;
+              author?: { date?: string };
+            };
+            files?: Array<{
+              filename: string;
+              status: string;
+              additions: number;
+              deletions: number;
+              patch?: string;
+            }>;
+          }>(`/repos/cloudflare/sandbox-sdk/commits/${commit}`);
+          if (!data) return { ok: false };
+          return {
+            ok: true,
+            sha: data.sha,
+            message: data.commit?.message ?? "",
+            date: data.commit?.author?.date ?? null,
+            files: (data.files ?? []).slice(0, 15).map((file) => ({
+              filename: file.filename,
+              status: file.status,
+              additions: file.additions,
+              deletions: file.deletions,
+              patch: file.patch?.slice(0, 500) ?? "",
+            })),
+          };
+        },
+      }),
+      listSandboxSDKPaths: tool({
+        description:
+          "List file paths in cloudflare/sandbox-sdk at a commit, optionally filtered by prefix or extension.",
+        inputSchema: z.object({
+          commit: z.string(),
+          prefix: z.string().optional(),
+          extension: z.string().optional(),
+          maxResults: z.coerce.number().int().min(1).max(200).optional(),
+        }),
+        execute: async ({ commit, prefix, extension, maxResults = 100 }) => {
+          const normalizedExtension = extension?.replace(/^\./, "");
+          const paths = (await this.sandboxSDKTree(commit))
+            .filter((entry) => entry.type === "blob")
+            .map((entry) => entry.path)
+            .filter((path) => !prefix || path.startsWith(prefix))
+            .filter(
+              (path) =>
+                !normalizedExtension ||
+                path.endsWith(`.${normalizedExtension}`),
+            )
+            .slice(0, maxResults);
+          return { ok: true, paths };
+        },
+      }),
+      searchSandboxSDKPaths: tool({
+        description:
+          "Search file paths in cloudflare/sandbox-sdk for scenario/code keywords.",
+        inputSchema: z.object({
+          commit: z.string(),
+          query: z.string(),
+          maxResults: z.coerce.number().int().min(1).max(100).optional(),
+        }),
+        execute: async ({ commit, query, maxResults = 50 }) => {
+          const terms = query
+            .toLowerCase()
+            .split(/[^a-z0-9_/-]+/)
+            .filter(Boolean);
+          const matches = (await this.sandboxSDKTree(commit))
+            .filter((entry) => entry.type === "blob")
+            .map((entry) => entry.path)
+            .filter((path) => {
+              const lower = path.toLowerCase();
+              return terms.every((term) => lower.includes(term));
+            })
+            .slice(0, maxResults);
+          return { ok: true, matches };
+        },
+      }),
+      searchSandboxSDKContent: tool({
+        description:
+          "Search text content in selected sandbox-sdk files. Use pathPrefix to keep the search targeted.",
+        inputSchema: z.object({
+          commit: z.string(),
+          query: z.string(),
+          pathPrefix: z.string().optional(),
+          maxFiles: z.coerce.number().int().min(1).max(40).optional(),
+        }),
+        execute: async ({ commit, query, pathPrefix, maxFiles = 25 }) => {
+          const textExtensions = new Set([
+            "ts",
+            "tsx",
+            "js",
+            "jsx",
+            "json",
+            "md",
+            "toml",
+            "yaml",
+            "yml",
+            "rs",
+            "py",
+            "sh",
+          ]);
+          const candidates = (await this.sandboxSDKTree(commit))
+            .filter((entry) => entry.type === "blob")
+            .filter((entry) => !pathPrefix || entry.path.startsWith(pathPrefix))
+            .filter((entry) => (entry.size ?? 0) <= 80_000)
+            .filter((entry) => {
+              const extension = entry.path.split(".").pop()?.toLowerCase();
+              return extension ? textExtensions.has(extension) : false;
+            })
+            .slice(0, maxFiles);
+
+          const matches: Array<{ path: string; lines: string[] }> = [];
+          for (const entry of candidates) {
+            const response = await fetch(
+              `https://raw.githubusercontent.com/cloudflare/sandbox-sdk/${commit}/${entry.path}`,
+              {
+                headers: { "User-Agent": "benchbox-sandbox-sdk-investigator" },
+              },
+            );
+            if (!response.ok) continue;
+            const lines = (await response.text()).split("\n");
+            const found = lines
+              .map((line, index) => ({ line, index }))
+              .filter(({ line }) =>
+                line.toLowerCase().includes(query.toLowerCase()),
+              )
+              .slice(0, 5)
+              .map(({ line, index }) => `${index + 1}: ${line.slice(0, 240)}`);
+            if (found.length > 0)
+              matches.push({ path: entry.path, lines: found });
+            if (matches.length >= 10) break;
+          }
+          return { ok: true, matches };
+        },
+      }),
+      listSandboxSDKTags: tool({
+        description:
+          "List recent cloudflare/sandbox-sdk tags to correlate SDK versions with commits.",
+        inputSchema: z.object({
+          maxResults: z.coerce.number().int().min(1).max(50).optional(),
+        }),
+        execute: async ({ maxResults = 20 }) => {
+          const tags = await this.githubJson<
+            Array<{ name: string; commit: { sha: string } }>
+          >(`/repos/cloudflare/sandbox-sdk/tags?per_page=${maxResults}`);
+          return {
+            ok: tags != null,
+            tags:
+              tags?.map((tag) => ({
+                name: tag.name,
+                commit: tag.commit.sha,
+              })) ?? [],
+          };
+        },
+      }),
+      searchSandboxSDKIssuesAndPRs: tool({
+        description:
+          "Search public GitHub issues/PRs in cloudflare/sandbox-sdk for related regression or release context.",
+        inputSchema: z.object({
+          query: z.string(),
+          maxResults: z.coerce.number().int().min(1).max(20).optional(),
+        }),
+        execute: async ({ query, maxResults = 10 }) => {
+          const encoded = encodeURIComponent(
+            `repo:cloudflare/sandbox-sdk ${query}`,
+          );
+          const data = await this.githubJson<{
+            items?: Array<{
+              title: string;
+              html_url: string;
+              state: string;
+              pull_request?: unknown;
+            }>;
+          }>(`/search/issues?q=${encoded}&per_page=${maxResults}`);
+          return {
+            ok: data != null,
+            results:
+              data?.items?.map((item) => ({
+                title: item.title,
+                url: item.html_url,
+                state: item.state,
+                type: item.pull_request ? "pull_request" : "issue",
+              })) ?? [],
+          };
+        },
+      }),
+      getHistoricalBenchmarkMetrics: tool({
+        description:
+          "Query BenchBox's D1 database for recent benchmark values of a specific scenario+metric. Use this to check whether a regression is consistent across runs (genuine) or a one-time spike (flaky). Also returns a coefficient of variation (CV): CV>0.10 = high variance / likely flaky.",
+        inputSchema: z.object({
+          scenario: z.string(),
+          metric: z.string(),
+          limit: z.coerce.number().int().min(1).max(30).optional(),
+        }),
+        execute: async ({ scenario, metric, limit = 20 }) => {
+          const { results } = await this.env.DB.prepare(
+            `SELECT m.mean_val, r.run_id, r.commit_sha
+             FROM perf_metrics m
+             JOIN perf_runs r ON r.run_id = m.run_id
+             WHERE m.scenario = ? AND m.metric_name = ?
+             ORDER BY r.timestamp DESC
+             LIMIT ?`,
+          )
+            .bind(scenario, metric, limit)
+            .all<{
+              mean_val: number;
+              run_id: string;
+              commit_sha: string | null;
+            }>();
+          if (!results.length) return { ok: false, message: "No data found" };
+          const oldest_first = [...results].reverse();
+          const vals = oldest_first.map((r) => r.mean_val);
+          const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+          const variance =
+            vals.map((v) => (v - mean) ** 2).reduce((a, b) => a + b, 0) /
+            vals.length;
+          const stddev = Math.sqrt(variance);
+          const cv = stddev / mean;
+          return {
+            ok: true,
+            scenario,
+            metric,
+            recentRuns: oldest_first.map((r) => ({
+              run: r.run_id,
+              commit: r.commit_sha?.slice(0, 7) ?? null,
+              value: r.mean_val,
+            })),
+            stats: {
+              mean: mean.toFixed(3),
+              stddev: stddev.toFixed(3),
+              cv: cv.toFixed(3),
+              flakiness: cv > 0.15 ? "high" : cv > 0.05 ? "medium" : "low",
+            },
+          };
+        },
+      }),
+    };
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === "/investigate" && request.method === "POST") {
+      const input = (await request.json()) as InvestigationRequest;
+      try {
+        return json(await this.runInvestigation(input));
+      } finally {
+        // Delete any Think recovery alarm left from previous runs to prevent
+        // stale-state errors on the next dev server restart.
+        await this.ctx.storage.deleteAlarm().catch(() => {});
+      }
+    }
+    return super.fetch(request);
+  }
+
+  private runInvestigation = async (
+    input: InvestigationRequest,
+  ): Promise<SDKInvestigation | null> => {
+    if (!input.currentRun.commit || !input.previousRun.commit) {
+      console.error("[investigator] null: missing commit sha");
+      return null;
+    }
+    if (input.currentRun.commit === input.previousRun.commit) {
+      console.error("[investigator] null: commits are identical");
+      return null;
+    }
+
+    const gatewayId = this.env.AI_GATEWAY_ID;
+    const provider = createWorkersAI({
+      binding: this.env.AI,
+      ...(gatewayId ? { gateway: { id: gatewayId } } : {}),
+    });
+
+    const parseDiagnosis = (t: string): Partial<SDKInvestigation> | null => {
+      const match = t.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      try {
+        const p = JSON.parse(match[0]) as Partial<SDKInvestigation>;
+        if (p.confidence && p.summary) return p;
+      } catch {
+        /* ignore */
+      }
+      return null;
+    };
+
+    // Phase 1 — Research: tool-calling loop, up to 15 steps.
+    const research = await generateText({
+      model: provider("@cf/moonshotai/kimi-k2.5"),
+      system: this.getSystemPrompt(),
+      messages: [
+        {
+          role: "user",
+          content: `Investigate this sandbox-sdk benchmark regression. Use tools to research — do NOT output text until you are done.\n\nContext:\n${JSON.stringify(input)}\n\nPlan:\n1. Compare the two commits.\n2. Fetch metadata for both.\n3. Identify changed files relevant to each signal.\n4. Search file paths and content for each affected scenario.\n5. Fetch targeted files when promising.\n6. Stop making tool calls when research is exhausted.`,
+        },
+      ],
+      tools: this.getTools(),
+      stopWhen: stepCountIs(12),
+      maxRetries: 1,
+    });
+
+    for (const [i, step] of research.steps.entries()) {
+      const calls = step.toolCalls
+        .map((c) => `${c.toolName}(${JSON.stringify(c.input).slice(0, 80)})`)
+        .join(", ");
+      console.error(
+        `[investigator] step ${i + 1}: finish=${step.finishReason} tools=[${calls}]`,
+      );
+    }
+    console.error(
+      `[investigator] research done: steps=${research.steps.length} finishReason=${research.finishReason}`,
+    );
+
+    // If the research phase itself produced a valid JSON answer, use it.
+    const earlyParsed = [
+      research.text,
+      ...research.steps.map((s) => s.text).reverse(),
+    ]
+      .map(parseDiagnosis)
+      .find(Boolean);
+    if (earlyParsed) {
+      console.error("[investigator] diagnosis found in research phase");
+      return {
+        verdict: earlyParsed.verdict ?? "inconclusive",
+        confidence: earlyParsed.confidence!,
+        summary: earlyParsed.summary!,
+        evidence: Array.isArray(earlyParsed.evidence)
+          ? earlyParsed.evidence.slice(0, 5)
+          : [],
+        changedFiles: Array.isArray(earlyParsed.changedFiles)
+          ? earlyParsed.changedFiles.filter(isSandboxSDKPath).slice(0, 8)
+          : [],
+      };
+    }
+
+    // Phase 2 — Synthesis: no tools, compact notes, must produce JSON.
+    // Prioritise the most informative tool results so truncation keeps signal not noise.
+    type ToolResult = { toolName: string; output: unknown };
+    const allResults: ToolResult[] = research.steps.flatMap(
+      (step) => step.toolResults as ToolResult[],
+    );
+
+    const tier1: string[] = []; // commit messages + compare file lists
+    const tier2: string[] = []; // fetched file contents
+    const tier3: string[] = []; // search matches
+    const tier4: string[] = []; // everything else
+
+    for (const tr of allResults) {
+      const out = tr.output as Record<string, unknown>;
+      if (tr.toolName === "getSandboxSDKCommit" && out?.message) {
+        type CommitFile = { filename: string; patch?: string };
+        const commitFiles = (out.files as CommitFile[] | undefined) ?? [];
+        const patchLines = commitFiles
+          .filter((f) => f.patch)
+          .map((f) => `  ${f.filename}:\n${f.patch}`)
+          .join("\n");
+        tier1.push(
+          `Commit ${String(out.sha ?? "").slice(0, 7)}: "${String(out.message).split("\n")[0]}"\nFiles: ${commitFiles.map((f) => f.filename).join(", ")}${patchLines ? `\nPatches:\n${patchLines}` : ""}`,
+        );
+      } else if (tr.toolName === "compareSandboxSDKCommits" && out?.files) {
+        type DiffFile = {
+          filename: string;
+          status: string;
+          additions: number;
+          deletions: number;
+          patch?: string;
+        };
+        const diffFiles = out.files as DiffFile[];
+        const summary = diffFiles
+          .map(
+            (f) =>
+              `${f.status}: ${f.filename} (+${f.additions}/-${f.deletions})${f.patch ? `\n    ${f.patch.slice(0, 300)}` : ""}`,
+          )
+          .join("\n");
+        tier1.push(`Compare diff:\n${summary}`);
+      } else if (tr.toolName === "fetchSandboxSDKFile" && out?.content) {
+        tier2.push(
+          `File ${String(out.path)}: ${String(out.content).slice(0, 800)}`,
+        );
+      } else if (
+        (tr.toolName === "searchSandboxSDKContent" ||
+          tr.toolName === "searchSandboxSDKPaths") &&
+        out?.ok
+      ) {
+        tier3.push(
+          `[${tr.toolName}]: ${JSON.stringify(tr.output).slice(0, 250)}`,
+        );
+      } else {
+        tier4.push(
+          `[${tr.toolName}]: ${JSON.stringify(tr.output).slice(0, 200)}`,
+        );
+      }
+    }
+
+    const researchNotes = [...tier1, ...tier2, ...tier3, ...tier4]
+      .join("\n")
+      .slice(0, 7000);
+
+    console.error(
+      `[investigator] synthesizing from ${allResults.length} results (t1=${tier1.length} t2=${tier2.length} t3=${tier3.length}) ${researchNotes.length} chars`,
+    );
+
+    const affectedScenarios = [
+      ...new Set(input.signals.map((s) => s.scenario)),
+    ].join(", ");
+
+    const synthesis = await generateText({
+      model: provider("@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+      system: `You are a performance engineering analyst. A benchmark regression was detected. Your job is to identify the CODE CHANGE that caused it based on research findings. Output ONLY valid JSON — no markdown fences, no explanation, no extra text.`,
+      messages: [
+        {
+          role: "user",
+          content: `A benchmark regression was detected in scenarios: ${affectedScenarios}.
+Commit range: ${input.previousRun.commit?.slice(0, 7)} → ${input.currentRun.commit?.slice(0, 7)}
+SDK version changed: ${input.sdk_version_changed} (${input.previousRun.sdkVersion} → ${input.currentRun.sdkVersion})
+
+RESEARCH FINDINGS (from inspecting the repository and benchmark history):
+${researchNotes}
+
+Based ONLY on the research findings above:
+
+- verdict: "genuine" if a specific source code change (not just a Dockerfile version bump) plausibly explains the regression; "flaky" if no source change correlates OR historical benchmark data shows high variance (CV>0.10) OR the regression looks like a one-time spike; "inconclusive" if changes exist but causal link is unclear
+- summary: One sentence. If genuine: what code changed and why it causes the regression. If flaky: why the data looks like noise. Max 240 chars. No percentages.
+- evidence: 2–4 specific observations from the findings. Not metric names. Use <b> tags around key values (file names, function names, commit hashes, SDK versions, numbers).
+- changedFiles: Source/test files (*.ts *.js *.py) under packages/ bridge/ tests/ only. EXCLUDE Dockerfile* .github/ .agents/ *.yml *.md *.json entirely.
+- confidence: "high" = clear conclusion; "medium" = plausible; "low" = unclear.
+
+{"verdict":"genuine"|"flaky"|"inconclusive","confidence":"low"|"medium"|"high","summary":"...","evidence":["..."],"changedFiles":["packages/..."]}`,
+        },
+      ],
+      maxRetries: 1,
+    });
+
+    console.error(
+      `[investigator] synthesis: finishReason=${synthesis.finishReason} text=${synthesis.text.slice(0, 300)}`,
+    );
+
+    const parsed = parseDiagnosis(synthesis.text);
+    if (!parsed) {
+      console.error("[investigator] null: synthesis produced no valid JSON");
+      return null;
+    }
+
+    return {
+      verdict: parsed.verdict ?? "inconclusive",
+      confidence: parsed.confidence!,
+      summary: parsed.summary!,
+      evidence: Array.isArray(parsed.evidence)
+        ? parsed.evidence.slice(0, 5)
+        : [],
+      changedFiles: Array.isArray(parsed.changedFiles)
+        ? parsed.changedFiles.filter(isSandboxSDKPath).slice(0, 5)
+        : [],
+    };
+  };
 }
 
 async function generateAIInsights(
@@ -255,6 +917,92 @@ Analysis rules:
   }
 }
 
+async function buildInvestigationRequest(
+  env: Env,
+  summary: RunSummary,
+  previousRunId?: string,
+): Promise<InvestigationRequest | null> {
+  const currentRun = summary.run;
+  const prevRun = previousRunId
+    ? await env.DB.prepare(
+        "SELECT run_id, commit_sha, sdk_version FROM perf_runs WHERE run_id = ?",
+      )
+        .bind(previousRunId)
+        .first<{
+          run_id: string;
+          commit_sha: string | null;
+          sdk_version: string | null;
+        }>()
+    : await env.DB.prepare(
+        `SELECT run_id, commit_sha, sdk_version FROM perf_runs
+         WHERE branch = ? AND run_id != ? AND timestamp < ?
+         ORDER BY timestamp DESC LIMIT 1`,
+      )
+        .bind(currentRun.branch ?? "", currentRun.run_id, currentRun.timestamp)
+        .first<{
+          run_id: string;
+          commit_sha: string | null;
+          sdk_version: string | null;
+        }>();
+
+  if (!currentRun.commit_sha || !prevRun?.commit_sha) return null;
+  if (currentRun.commit_sha === prevRun.commit_sha) return null;
+
+  const previousValues = new Map<string, number>();
+  const { results } = await env.DB.prepare(
+    `SELECT scenario, metric_name, mean_val
+     FROM perf_metrics WHERE run_id = ?`,
+  )
+    .bind(prevRun.run_id)
+    .all<PerfMetric>();
+  for (const metric of results) {
+    if (metric.mean_val == null) continue;
+    previousValues.set(
+      `${metric.scenario}||${metric.metric_name}`,
+      metric.mean_val,
+    );
+  }
+
+  const signals = [
+    ...summary.failures,
+    ...summary.shortTermRegressions,
+    ...summary.longTermRegressions,
+  ]
+    .slice(0, 5)
+    .map((signal) => ({
+      scenario: signal.scenario,
+      metric: signal.metric_name,
+      unit: signal.unit,
+      historical_baseline_mean: signal.historicalMean.toFixed(2),
+      previous_run_mean:
+        previousValues
+          .get(`${signal.scenario}||${signal.metric_name}`)
+          ?.toFixed(2) ?? null,
+      current: signal.current.toFixed(2),
+      baseline_pct_change: `${(signal.pctChange * 100).toFixed(1)}%`,
+      z: signal.zScore.toFixed(2),
+      slope: `${(signal.slopePctPerRun * 100).toFixed(2)}%/run`,
+    }));
+
+  if (signals.length === 0) return null;
+
+  return {
+    currentRun: {
+      runId: currentRun.run_id,
+      commit: currentRun.commit_sha,
+      sdkVersion: currentRun.sdk_version,
+    },
+    previousRun: {
+      runId: prevRun.run_id,
+      commit: prevRun.commit_sha,
+      sdkVersion: prevRun.sdk_version,
+    },
+    commit_changed: currentRun.commit_sha !== prevRun.commit_sha,
+    sdk_version_changed: currentRun.sdk_version !== prevRun.sdk_version,
+    signals,
+  };
+}
+
 const Z_THRESHOLD = 2.0;
 const SLOPE_THRESHOLD = 0.02;
 const FAILURE_UNITS = new Set(["percent", "%", "count", "counts"]);
@@ -390,6 +1138,8 @@ function buildGoogleChatMessage(
   summary: RunSummary,
   dashboardUrl: string,
   insights: AIInsights | null = null,
+  investigation: SDKInvestigation | null = null,
+  investigationPending = false,
 ): object {
   const { run } = summary;
 
@@ -446,18 +1196,66 @@ function buildGoogleChatMessage(
 
   const sections: object[] = [{ widgets }];
 
-  if (insights?.justification) {
+  const analysisWidgets: object[] = [];
+
+  if (investigation) {
+    const confidenceColor =
+      investigation.confidence === "high"
+        ? "#137333"
+        : investigation.confidence === "medium"
+          ? "#c26401"
+          : "#444746";
+    const evidenceText = investigation.evidence
+      .map((item) => `• ${item}`)
+      .join("<br>");
+    const changedFilesText = investigation.changedFiles
+      .filter(isSandboxSDKPath)
+      .map((file) =>
+        run.commit_sha
+          ? `• <a href="${sandboxSDKFileUrl(run.commit_sha, file)}">${file}</a>`
+          : `• <font color="#444746">${file}</font>`,
+      )
+      .join("<br>");
+
+    const verdictLabel =
+      investigation.verdict === "genuine"
+        ? "⚠️ genuine regression"
+        : investigation.verdict === "flaky"
+          ? "🔀 likely flaky"
+          : "❓ inconclusive";
+    const verdictColor =
+      investigation.verdict === "genuine"
+        ? confidenceColor
+        : investigation.verdict === "flaky"
+          ? "#444746"
+          : "#c26401";
+    analysisWidgets.push({
+      textParagraph: {
+        text: `<b>SDK investigation</b> · <font color="${verdictColor}">${verdictLabel}</font> · ${investigation.confidence} confidence<br>${investigation.summary}`,
+      },
+    });
+    if (evidenceText) {
+      analysisWidgets.push({
+        textParagraph: { text: `<b>Evidence</b><br>${evidenceText}` },
+      });
+    }
+    if (changedFilesText) {
+      analysisWidgets.push({
+        textParagraph: { text: `<b>Relevant files</b><br>${changedFilesText}` },
+      });
+    }
+  } else if (!investigationPending && insights?.justification) {
+    analysisWidgets.push({
+      textParagraph: { text: insights.justification },
+    });
+  }
+
+  if (analysisWidgets.length > 0) {
     sections.push({
       header: "Analysis",
       collapsible: true,
       uncollapsibleWidgetsCount: 0,
-      widgets: [
-        {
-          textParagraph: {
-            text: insights.justification,
-          },
-        },
-      ],
+      widgets: analysisWidgets,
     });
   }
 
@@ -486,10 +1284,133 @@ function buildGoogleChatMessage(
   };
 }
 
+function buildInvestigationFollowUpCard(
+  summary: RunSummary,
+  investigation: SDKInvestigation,
+  dashboardUrl: string,
+): object {
+  const { run } = summary;
+  const sha = run.commit_sha ? run.commit_sha.slice(0, 7) : "unknown";
+  const baseUrl = dashboardUrl.replace(/\/$/, "");
+  const confidenceColor =
+    investigation.confidence === "high"
+      ? "#137333"
+      : investigation.confidence === "medium"
+        ? "#c26401"
+        : "#444746";
+  const verdictLabel =
+    investigation.verdict === "genuine"
+      ? "\u26a0\ufe0f genuine regression"
+      : investigation.verdict === "flaky"
+        ? "\ud83d\udd00 likely flaky"
+        : "\u2753 inconclusive";
+  const verdictColor =
+    investigation.verdict === "genuine"
+      ? confidenceColor
+      : investigation.verdict === "flaky"
+        ? "#444746"
+        : "#c26401";
+  const widgets: object[] = [];
+  widgets.push({
+    textParagraph: {
+      text: `<b>SDK investigation</b> \u00b7 <font color="${verdictColor}">${verdictLabel}</font> \u00b7 ${investigation.confidence} confidence<br>${investigation.summary}`,
+    },
+  });
+  const evidenceText = investigation.evidence
+    .map((e) => `\u2022 ${e}`)
+    .join("<br>");
+  if (evidenceText) {
+    widgets.push({
+      textParagraph: { text: `<b>Evidence</b><br>${evidenceText}` },
+    });
+  }
+  const changedFilesText = investigation.changedFiles
+    .filter(isSandboxSDKPath)
+    .map((file) =>
+      run.commit_sha
+        ? `\u2022 <a href="${sandboxSDKFileUrl(run.commit_sha, file)}">${file}</a>`
+        : `\u2022 <font color="#444746">${file}</font>`,
+    )
+    .join("<br>");
+  if (changedFilesText) {
+    widgets.push({
+      textParagraph: { text: `<b>Relevant files</b><br>${changedFilesText}` },
+    });
+  }
+  return {
+    cardsV2: [
+      {
+        cardId: `benchbox-investigation-${run.run_id}`,
+        card: {
+          header: {
+            title: "SDK Investigation",
+            subtitle: `${sha}${run.sdk_version ? ` \u00b7 SDK ${run.sdk_version}` : ""}`,
+            imageUrl: `${baseUrl}/favicon.png`,
+            imageType: "CIRCLE",
+          },
+          sections: [{ widgets }],
+        },
+      },
+    ],
+  };
+}
+
+async function runBackgroundInvestigation(
+  env: Env,
+  summary: RunSummary,
+  investigationRequest: InvestigationRequest,
+  threadName: string | null,
+): Promise<void> {
+  let investigation: SDKInvestigation | null = null;
+  try {
+    const investigator = env.SandboxSDKInvestigator.get(
+      env.SandboxSDKInvestigator.idFromName(summary.run.run_id),
+    );
+    const resp = await investigator.fetch(
+      "https://sandbox-sdk-investigator/investigate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(investigationRequest),
+      },
+    );
+    if (resp.ok) {
+      investigation = (await resp.json()) as SDKInvestigation | null;
+    } else {
+      console.error(`[notify] investigation failed: ${resp.status}`);
+    }
+  } catch (err) {
+    console.error("[notify] background investigation error:", err);
+    return;
+  }
+  if (!investigation) return;
+
+  const followUp = buildInvestigationFollowUpCard(
+    summary,
+    investigation,
+    env.DASHBOARD_URL,
+  );
+  const webhookUrl = threadName
+    ? `${env.GOOGLE_CHAT_WEBHOOK_URL}&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD`
+    : env.GOOGLE_CHAT_WEBHOOK_URL;
+  const body = threadName
+    ? { ...followUp, thread: { name: threadName } }
+    : followUp;
+  await fetch(webhookUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((e) => console.error("[notify] follow-up post failed:", e));
+}
+
 // ---------------------------------------------------------------------------
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
@@ -691,9 +1612,14 @@ export default {
         }
 
         let runId: string | undefined;
+        let previousRunId: string | undefined;
         try {
-          const body = (await request.json()) as { run_id?: string };
+          const body = (await request.json()) as {
+            run_id?: string;
+            previous_run_id?: string;
+          };
           runId = body.run_id;
+          previousRunId = body.previous_run_id;
         } catch {
           // body is optional — falls back to latest run
         }
@@ -714,10 +1640,19 @@ export default {
         }
 
         const insights = await generateAIInsights(env, summary);
+        const investigationRequest = await buildInvestigationRequest(
+          env,
+          summary,
+          previousRunId,
+        );
+
+        // Post initial card immediately — investigation runs in background.
         const message = buildGoogleChatMessage(
           summary,
           env.DASHBOARD_URL,
           insights,
+          null,
+          investigationRequest != null,
         );
         const gchatResp = await fetch(env.GOOGLE_CHAT_WEBHOOK_URL, {
           method: "POST",
@@ -735,14 +1670,40 @@ export default {
           );
         }
 
+        // Extract thread name from GChat response for threaded follow-up.
+        let threadName: string | null = null;
+        try {
+          const gchatBody = (await gchatResp.json()) as {
+            thread?: { name?: string };
+          };
+          threadName = gchatBody.thread?.name ?? null;
+        } catch {
+          // non-critical
+        }
+
+        // Fire investigation in background — returns 200 immediately.
+        if (investigationRequest) {
+          ctx.waitUntil(
+            runBackgroundInvestigation(
+              env,
+              summary,
+              investigationRequest,
+              threadName,
+            ),
+          );
+        }
+
         return json({
           ok: true,
           run_id: summary.run.run_id,
+          previous_run_id: investigationRequest?.previousRun.runId ?? null,
           failures: summary.failures.length,
           short_term_regressions: summary.shortTermRegressions.length,
           short_term_improvements: summary.shortTermImprovements.length,
           long_term_regressions: summary.longTermRegressions.length,
           long_term_improvements: summary.longTermImprovements.length,
+          sdk_investigation: investigationRequest != null,
+          sdk_investigation_error: null,
         });
       }
 

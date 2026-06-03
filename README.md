@@ -1,73 +1,60 @@
-# React + TypeScript + Vite
+# BenchBox
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+> Performance monitoring dashboard for [`cloudflare/sandbox-sdk`](https://github.com/cloudflare/sandbox-sdk).
 
-Currently, two official plugins are available:
+BenchBox ingests benchmark run results, stores them in a Cloudflare D1 database, and surfaces regressions, trends, and AI-generated insights through a React dashboard. When something looks off, it also dispatches a `SandboxSDKInvestigator` agent that inspects the relevant SDK code changes and posts a diagnosis to Google Chat.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+---
 
-## React Compiler
+## What it does
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **Tracks benchmark runs** — each run carries metrics per scenario (latency percentiles, pass rates, etc.) tied to a commit SHA, branch, and SDK version.
+- **Detects regressions** — statistical analysis using z-scores (short-term spikes) and linear regression slopes (long-term drift), plus direct failure detection for pass-rate drops.
+- **AI insights** — Workers AI (Llama 3.3 70B) summarises each run with a verdict (`action_required` / `worth_watching` / `clean`) and per-metric reasoning.
+- **SDK investigation** — a `SandboxSDKInvestigator` Durable Object agent (powered by [Project Think](https://github.com/cloudflare/agents)) inspects GitHub diffs, commit metadata, and source files across the sandbox-sdk repo to correlate code changes with benchmark signals.
+- **Google Chat notifications** — `POST /api/notify` builds and sends a rich card with the run summary, AI verdict, and a collapsed SDK investigation section when relevant.
+- **Dashboard** — React + Recharts SPA with per-scenario trend charts, a runs table, run detail drill-down, and dark/light theme support.
 
-## Expanding the ESLint configuration
+---
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+## Stack
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+| Layer | Technology |
+|---|---|
+| Frontend | React 19, TypeScript, TailwindCSS v4, Recharts |
+| Backend | Cloudflare Worker (TypeScript) |
+| Database | Cloudflare D1 (`sandbox-perf-results`) |
+| AI | Workers AI — `@cf/meta/llama-3.3-70b-instruct-fp8-fast` |
+| Agent | `@cloudflare/think` Durable Object |
+| Build | Vite + `@cloudflare/vite-plugin` |
+| Deploy | Wrangler |
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+---
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Development
+
+```bash
+npm install
+npm run dev          # Vite dev server + local Worker
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Copy `.dev.vars.example` to `.dev.vars` and fill in any required secrets before running locally.
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## Deployment
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+npm run deploy       # tsc + vite build + wrangler deploy
 ```
+
+---
+
+## API
+
+| Route | Method | Description |
+|---|---|---|
+| `/api/runs` | `GET` | List benchmark runs (filterable by branch, trigger, date) |
+| `/api/runs/:id` | `GET` | Run detail with per-metric data |
+| `/api/summary` | `GET` | Aggregate summary stats |
+| `/api/analysis` | `GET` | Latest run regression analysis |
+| `/api/filters` | `GET` | Available filter options |
+| `/api/notify` | `POST` | Ingest a run, compute analysis, send GChat notification |

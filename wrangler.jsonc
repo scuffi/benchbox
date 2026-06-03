@@ -46,8 +46,25 @@
 		"binding": "AI"
 	},
 	"vars": {
-		"DASHBOARD_URL": "https://benchbox.agents-b8a.workers.dev/"
-	}
+		"DASHBOARD_URL": "https://benchbox.agents-b8a.workers.dev/",
+		"AI_GATEWAY_ID": ""
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "SandboxSDKInvestigator",
+				"class_name": "SandboxSDKInvestigator"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"SandboxSDKInvestigator"
+			]
+		}
+	]
 	/**
 	 * Service Bindings (communicate between multiple Workers)
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings

@@ -21,9 +21,16 @@ fi
 URL="${NOTIFY_URL:-http://localhost:8787}/api/notify"
 echo "Sending test notification to $URL ..."
 
+BODY="$(node -e '
+const body = {};
+if (process.env.RUN_ID) body.run_id = process.env.RUN_ID;
+if (process.env.PREVIOUS_RUN_ID) body.previous_run_id = process.env.PREVIOUS_RUN_ID;
+process.stdout.write(JSON.stringify(body));
+')"
+
 curl -sL -X POST "$URL" \
   -H "Authorization: Bearer $NOTIFY_SECRET" \
   -H "Content-Type: application/json" \
-  -d '{}' | cat
+  -d "$BODY" | cat
 
 echo
