@@ -263,8 +263,10 @@ function BackupRestoreLayout({
       {sizes.map((size) => {
         const sizeData = sizedData.filter((d) => d.metric.size === size);
         if (sizeData.length === 0) return null;
+        const createEntry = sizeData.find((d) => d.metric.group === "create");
+        const restoreEntry = sizeData.find((d) => d.metric.group === "restore");
         return (
-          <div key={size}>
+          <div key={size} className="space-y-3">
             <SectionLabel>{size}</SectionLabel>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {sizeData.map((d) => (
@@ -275,6 +277,26 @@ function BackupRestoreLayout({
                   large
                 />
               ))}
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {createEntry && (
+                <MiniTrendChart
+                  title="Create trend"
+                  trend={createEntry.trend}
+                  kind={createEntry.metric.kind}
+                  unit={createEntry.current?.unit ?? unit}
+                  color="#F48120"
+                />
+              )}
+              {restoreEntry && (
+                <MiniTrendChart
+                  title="Restore trend"
+                  trend={restoreEntry.trend}
+                  kind={restoreEntry.metric.kind}
+                  unit={restoreEntry.current?.unit ?? unit}
+                  color="#6366f1"
+                />
+              )}
             </div>
           </div>
         );

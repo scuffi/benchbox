@@ -76,6 +76,185 @@ interface RunSummary {
   historyRunCount: number;
 }
 
+interface AIInsight {
+  label: string;
+  insight: string;
+}
+
+interface AIInsights {
+  verdict: "action_required" | "worth_watching" | "clean";
+  headline: string;
+  topIssues: AIInsight[];
+  justification: string;
+}
+
+async function generateAIInsights(
+  env: Env,
+  summary: RunSummary,
+): Promise<AIInsights | null> {
+  if (!env.AI) return null;
+
+  const {
+    failures,
+    shortTermRegressions,
+    shortTermImprovements,
+    longTermRegressions,
+    longTermImprovements,
+    run,
+    historyRunCount,
+  } = summary;
+
+  const prevRun = await env.DB.prepare(
+    `SELECT run_id, commit_sha, sdk_version FROM perf_runs
+     WHERE branch = ? AND run_id != ? AND timestamp < ?
+     ORDER BY timestamp DESC LIMIT 1`,
+  )
+    .bind(run.branch ?? "", run.run_id, run.timestamp)
+    .first<{
+      run_id: string;
+      commit_sha: string | null;
+      sdk_version: string | null;
+    }>();
+
+  const previousValues = new Map<string, number>();
+  if (prevRun) {
+    const { results } = await env.DB.prepare(
+      `SELECT scenario, metric_name, mean_val
+       FROM perf_metrics WHERE run_id = ?`,
+    )
+      .bind(prevRun.run_id)
+      .all<PerfMetric>();
+    for (const metric of results) {
+      if (metric.mean_val == null) continue;
+      previousValues.set(
+        `${metric.scenario}||${metric.metric_name}`,
+        metric.mean_val,
+      );
+    }
+  }
+
+  const longTermRegSet = new Set(
+    longTermRegressions.map((r) => `${r.scenario}||${r.metric_name}`),
+  );
+  const longTermImpSet = new Set(
+    longTermImprovements.map((r) => `${r.scenario}||${r.metric_name}`),
+  );
+  const shortTermRegSet = new Set(
+    shortTermRegressions.map((r) => `${r.scenario}||${r.metric_name}`),
+  );
+
+  const data = {
+    branch: run.branch ?? "unknown",
+    commit: run.commit_sha?.slice(0, 7) ?? "unknown",
+    sdk_version: run.sdk_version ?? null,
+    prev_commit: prevRun?.commit_sha?.slice(0, 7) ?? null,
+    prev_sdk_version: prevRun?.sdk_version ?? null,
+    commit_changed: prevRun ? prevRun.commit_sha !== run.commit_sha : null,
+    sdk_changed: prevRun ? prevRun.sdk_version !== run.sdk_version : null,
+    history_runs: historyRunCount,
+    direct_failures: failures.slice(0, 3).map((f) => ({
+      scenario: f.scenario,
+      metric: f.metric_name,
+      unit: f.unit,
+      historical_baseline_mean: f.historicalMean.toFixed(2),
+      previous_run_mean:
+        previousValues.get(`${f.scenario}||${f.metric_name}`)?.toFixed(2) ??
+        null,
+      current: f.current.toFixed(2),
+      baseline_pct_change: `${(f.pctChange * 100).toFixed(1)}%`,
+      samples: f.sampleCount,
+    })),
+    short_term_regressions: shortTermRegressions.slice(0, 5).map((r) => ({
+      scenario: r.scenario,
+      metric: r.metric_name,
+      unit: r.unit,
+      historical_baseline_mean: r.historicalMean.toFixed(2),
+      previous_run_mean:
+        previousValues.get(`${r.scenario}||${r.metric_name}`)?.toFixed(2) ??
+        null,
+      current: r.current.toFixed(2),
+      baseline_pct_change: `${(r.pctChange * 100).toFixed(1)}%`,
+      z: r.zScore.toFixed(2),
+      samples: r.sampleCount,
+      alsoLongTermTrend: longTermRegSet.has(`${r.scenario}||${r.metric_name}`),
+      revertingImprovement: longTermImpSet.has(
+        `${r.scenario}||${r.metric_name}`,
+      ),
+    })),
+    short_term_improvements: shortTermImprovements.length,
+    long_term_regressions: longTermRegressions.slice(0, 3).map((r) => ({
+      scenario: r.scenario,
+      metric: r.metric_name,
+      slope: `${(r.slopePctPerRun * 100).toFixed(2)}%/run`,
+      samples: r.sampleCount,
+      alsoShortTermSpike: shortTermRegSet.has(
+        `${r.scenario}||${r.metric_name}`,
+      ),
+    })),
+    long_term_improvements: longTermImprovements.length,
+  };
+
+  const systemPrompt = `You are a performance engineering analyst reviewing benchmark CI results. Respond ONLY with valid JSON matching this exact schema — no markdown, no extra text:
+{"verdict":"action_required"|"worth_watching"|"clean","headline":"<≤90 chars summary>","topIssues":[{"label":"<exact: scenario / metric_name>","insight":"<≤130 chars HTML: use <b> around key numbers/metrics>"}],"justification":"<≤500 chars HTML analysis using <b> for numbers and <br> for paragraph breaks>"}
+Analysis rules:
+- commit_changed=false AND sdk_changed=false: strong flakiness indicator — lower verdict tier, mention in justification
+- commit_changed=true OR sdk_changed=true: changes present, regression more likely genuine
+- sdk_changed=true: note the SDK version change (prev→current) when relevant
+- alsoLongTermTrend=true: metric is both spiking and on a sustained upward trend — highest credibility signal
+- alsoShortTermSpike=true on a long-term trend: gradual regression now accelerating
+- Borderline z-score (2.0–2.5) + no long-term trend + commit_changed=false: very likely noise — omit from topIssues
+- Low samples (<5): limited history, be conservative
+- verdict=action_required: direct failures OR (z>2.5 AND changes present) OR alsoLongTermTrend
+- verdict=worth_watching: genuine trends, or z>2.5 with unchanged commit/sdk
+- verdict=clean: borderline signals only, or all regressions look like noise
+- insight: state what the data shows using exact current, previous_run_mean, historical_baseline_mean, baseline_pct_change, z values wrapped in <b>; no actions or fixes
+- historical_baseline_mean is the average of prior runs, not the immediately previous run; never describe it as "previous"
+- justification: write 2–3 short analytical sentences explaining the overall assessment reasoning; use <b> for key numbers; use <br> to separate distinct points
+- label: must be exactly "scenario / metric_name" using the exact values from the data
+- topIssues: empty when clean or all noise; max 3 credible signals`;
+
+  const userPrompt = `Benchmark run data: ${JSON.stringify(data)}`;
+
+  try {
+    const result = await env.AI.run(
+      "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+      {
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: 800,
+        temperature: 0.1,
+      },
+    );
+
+    let text: string | undefined;
+    if (typeof result === "string") {
+      text = result;
+    } else if (result && typeof result === "object" && "response" in result) {
+      text = (result as { response: string }).response;
+    }
+
+    if (!text) return null;
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+
+    const parsed = JSON.parse(jsonMatch[0]) as Partial<AIInsights>;
+    if (!parsed.verdict || !parsed.headline) return null;
+    return {
+      verdict: parsed.verdict,
+      headline: parsed.headline,
+      topIssues: Array.isArray(parsed.topIssues)
+        ? parsed.topIssues.slice(0, 3)
+        : [],
+      justification: parsed.justification ?? "",
+    };
+  } catch {
+    return null;
+  }
+}
+
 const Z_THRESHOLD = 2.0;
 const SLOPE_THRESHOLD = 0.02;
 const FAILURE_UNITS = new Set(["percent", "%", "count", "counts"]);
@@ -207,202 +386,79 @@ async function buildRunSummary(
   };
 }
 
-function fmtNum(val: number, unit: string | null): string {
-  return `${val.toFixed(2)}${unit ? ` ${unit}` : ""}`;
-}
-
-function fmtPct(pct: number): string {
-  return `${pct >= 0 ? "+" : ""}${(pct * 100).toFixed(1)}%`;
-}
-
-function col(topLabel: string, text: string, bottomLabel?: string): object {
-  return {
-    horizontalSizeStyle: "FILL_AVAILABLE_SPACE",
-    horizontalAlignment: "START",
-    verticalAlignment: "CENTER",
-    widgets: [
-      {
-        decoratedText: {
-          topLabel,
-          text,
-          ...(bottomLabel ? { bottomLabel } : {}),
-        },
-      },
-    ],
-  };
-}
-
-function twoCol(left: object, right: object): object {
-  return { columns: { columnItems: [left, right] } };
-}
-
-function metricWidget(r: MetricChange, valueHtml: string, sub: string): object {
-  return {
-    decoratedText: {
-      topLabel: `${r.scenario} / ${r.metric_name}`,
-      text: valueHtml,
-      bottomLabel: sub,
-    },
-  };
-}
-
-function collapsibleSection(header: string, widgets: object[]): object {
-  return {
-    header,
-    collapsible: true,
-    uncollapsibleWidgetsCount: 0,
-    widgets,
-  };
-}
-
 function buildGoogleChatMessage(
   summary: RunSummary,
   dashboardUrl: string,
+  insights: AIInsights | null = null,
 ): object {
-  const {
-    run,
-    metrics,
-    failures,
-    shortTermRegressions,
-    shortTermImprovements,
-    longTermRegressions,
-    longTermImprovements,
-  } = summary;
+  const { run } = summary;
 
   const sha = run.commit_sha ? run.commit_sha.slice(0, 7) : "unknown";
-  const measuredCount = metrics.filter((m) => m.mean_val != null).length;
-  // --- Card header ---
+  const baseUrl = dashboardUrl.replace(/\/$/, "");
   const header = {
-    title: "BenchBox Performance Report",
+    title: "BenchBox",
     subtitle: `${run.branch ?? "unknown"} · ${sha}${run.sdk_version ? ` · SDK ${run.sdk_version}` : ""}`,
+    imageUrl: `${baseUrl}/favicon.png`,
+    imageType: "CIRCLE",
   };
 
-  const sections: object[] = [];
+  const widgets: object[] = [];
 
-  // --- Section 2: Analysis summary ---
-  const failHtml =
-    failures.length > 0
-      ? `<font color="#a50e0e"><b>${failures.length} failure${failures.length !== 1 ? "s" : ""}</b></font>`
-      : `<font color="#137333">0 failures</font>`;
-  const srHtml =
-    shortTermRegressions.length > 0
-      ? `<font color="#d93025"><b>${shortTermRegressions.length} regression${shortTermRegressions.length !== 1 ? "s" : ""}</b></font>`
-      : `<font color="#137333">0 regressions</font>`;
-  const siHtml =
-    shortTermImprovements.length > 0
-      ? `<font color="#137333"><b>${shortTermImprovements.length} improvement${shortTermImprovements.length !== 1 ? "s" : ""}</b></font>`
-      : `<font color="#5f6368">0 improvements</font>`;
-  const lrHtml =
-    longTermRegressions.length > 0
-      ? `<font color="#e37400"><b>${longTermRegressions.length} upward trend${longTermRegressions.length !== 1 ? "s" : ""}</b></font>`
-      : `<font color="#137333">0 upward trends</font>`;
-  const liHtml =
-    longTermImprovements.length > 0
-      ? `<font color="#137333"><b>${longTermImprovements.length} downward trend${longTermImprovements.length !== 1 ? "s" : ""}</b></font>`
-      : `<font color="#5f6368">0 downward trends</font>`;
+  if (insights) {
+    const verdictColor =
+      insights.verdict === "action_required"
+        ? "#b31412"
+        : insights.verdict === "worth_watching"
+          ? "#c26401"
+          : "#137333";
+    const verdictIcon =
+      insights.verdict === "action_required"
+        ? "🔴"
+        : insights.verdict === "worth_watching"
+          ? "🟡"
+          : "🟢";
+    const verdictLabel =
+      insights.verdict === "action_required"
+        ? "ACTION REQUIRED"
+        : insights.verdict === "worth_watching"
+          ? "WORTH A LOOK"
+          : "ALL CLEAR";
 
-  sections.push({
-    header: `📊 Analysis · ${measuredCount} metrics`,
-    widgets: [
-      twoCol(
-        col("COUNT/PERCENT (direct)", failHtml),
-        col(`SHORT-TERM (z≥${Z_THRESHOLD}σ)`, `${srHtml} · ${siHtml}`),
-      ),
-      {
-        decoratedText: {
-          topLabel: `LONG-TERM (≥${(SLOPE_THRESHOLD * 100).toFixed(0)}%/run)`,
-          text: `${lrHtml} · ${liHtml}`,
-        },
+    widgets.push({
+      textParagraph: {
+        text: `<font color="${verdictColor}"><b>${verdictIcon} ${verdictLabel}</b></font><br><font color="#444746">${insights.headline}</font>`,
       },
-    ],
-  });
+    });
 
-  // --- Section 3: Direct failures (conditional, highest priority) ---
-  if (failures.length > 0) {
-    sections.push(
-      collapsibleSection(
-        `🚨 Direct Failures (${failures.length}) — count/percent dropped`,
-        failures.map((f) =>
-          metricWidget(
-            f,
-            `<font color="#a50e0e">${fmtNum(f.historicalMean, f.unit)} → <b>${fmtNum(f.current, f.unit)}</b></font>`,
-            `${fmtPct(f.pctChange)} · ${f.sampleCount} samples`,
-          ),
-        ),
-      ),
-    );
+    if (insights.topIssues.length > 0) {
+      widgets.push({ divider: {} });
+      for (const issue of insights.topIssues) {
+        widgets.push({
+          decoratedText: {
+            startIcon: { materialIcon: { name: "monitoring" } },
+            topLabel: issue.label,
+            text: issue.insight,
+          },
+        });
+      }
+    }
   }
 
-  // --- Section 4: Short-term regressions (conditional) ---
-  if (shortTermRegressions.length > 0) {
-    sections.push(
-      collapsibleSection(
-        `🔴 Short-term Regressions (${shortTermRegressions.length}) — sudden spike`,
-        shortTermRegressions
-          .slice(0, 10)
-          .map((r) =>
-            metricWidget(
-              r,
-              `<font color="#d93025">${fmtNum(r.historicalMean, r.unit)} → <b>${fmtNum(r.current, r.unit)}</b></font>`,
-              `z=${r.zScore.toFixed(2)}σ · ${fmtPct(r.pctChange)} · ${r.sampleCount} samples`,
-            ),
-          ),
-      ),
-    );
-  }
+  const sections: object[] = [{ widgets }];
 
-  // --- Section 5: Short-term improvements (conditional) ---
-  if (shortTermImprovements.length > 0) {
-    sections.push(
-      collapsibleSection(
-        `🟢 Short-term Improvements (${shortTermImprovements.length}) — sudden drop`,
-        shortTermImprovements
-          .slice(0, 10)
-          .map((imp) =>
-            metricWidget(
-              imp,
-              `<font color="#137333">${fmtNum(imp.historicalMean, imp.unit)} → <b>${fmtNum(imp.current, imp.unit)}</b></font>`,
-              `z=${imp.zScore.toFixed(2)}σ · ${fmtPct(imp.pctChange)} · ${imp.sampleCount} samples`,
-            ),
-          ),
-      ),
-    );
-  }
-
-  // --- Section 6: Long-term regression trends (conditional) ---
-  if (longTermRegressions.length > 0) {
-    sections.push(
-      collapsibleSection(
-        `📈 Long-term Regression Trends (${longTermRegressions.length}) — gradual increase`,
-        longTermRegressions
-          .slice(0, 10)
-          .map((r) =>
-            metricWidget(
-              r,
-              `<font color="#e37400"><b>+${(r.slopePctPerRun * 100).toFixed(2)}%/run</b></font>`,
-              `mean ${fmtNum(r.historicalMean, r.unit)} · ${r.sampleCount} samples`,
-            ),
-          ),
-      ),
-    );
-  }
-
-  // --- Section 7: Long-term improvement trends (conditional) ---
-  if (longTermImprovements.length > 0) {
-    sections.push(
-      collapsibleSection(
-        `📉 Long-term Improvement Trends (${longTermImprovements.length}) — gradual decrease`,
-        longTermImprovements
-          .slice(0, 10)
-          .map((imp) =>
-            metricWidget(
-              imp,
-              `<font color="#137333"><b>${(imp.slopePctPerRun * 100).toFixed(2)}%/run</b></font>`,
-              `mean ${fmtNum(imp.historicalMean, imp.unit)} · ${imp.sampleCount} samples`,
-            ),
-          ),
-      ),
-    );
+  if (insights?.justification) {
+    sections.push({
+      header: "Analysis",
+      collapsible: true,
+      uncollapsibleWidgetsCount: 0,
+      widgets: [
+        {
+          textParagraph: {
+            text: insights.justification,
+          },
+        },
+      ],
+    });
   }
 
   sections.push({
@@ -657,7 +713,12 @@ export default {
           });
         }
 
-        const message = buildGoogleChatMessage(summary, env.DASHBOARD_URL);
+        const insights = await generateAIInsights(env, summary);
+        const message = buildGoogleChatMessage(
+          summary,
+          env.DASHBOARD_URL,
+          insights,
+        );
         const gchatResp = await fetch(env.GOOGLE_CHAT_WEBHOOK_URL, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
