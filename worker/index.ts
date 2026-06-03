@@ -267,17 +267,10 @@ function buildGoogleChatMessage(
     shortTermImprovements,
     longTermRegressions,
     longTermImprovements,
-    historyRunCount,
   } = summary;
 
   const sha = run.commit_sha ? run.commit_sha.slice(0, 7) : "unknown";
   const measuredCount = metrics.filter((m) => m.mean_val != null).length;
-  const hasFailures = failures.length > 0;
-  const hasIssues =
-    shortTermRegressions.length > 0 || longTermRegressions.length > 0;
-  const durationText =
-    run.duration_ms != null ? `${(run.duration_ms / 1000).toFixed(1)}s` : "—";
-
   // --- Card header ---
   const header = {
     title: "BenchBox Performance Report",
@@ -285,33 +278,6 @@ function buildGoogleChatMessage(
   };
 
   const sections: object[] = [];
-
-  // --- Section 1: Run overview ---
-  const statusHtml = hasFailures
-    ? `<font color="#a50e0e">🚨 Failures Detected</font>`
-    : hasIssues
-      ? `<font color="#d93025">⚠️ Issues Detected</font>`
-      : `<font color="#137333">✅ All Clear</font>`;
-
-  sections.push({
-    widgets: [
-      twoCol(
-        col("STATUS", statusHtml),
-        col("RUN", `<font color="#5f6368">${run.run_id}</font>`),
-      ),
-      twoCol(
-        col("PASSED", `${run.passed ?? "?"}/${run.total ?? "?"}`),
-        col("DURATION", durationText),
-      ),
-      twoCol(
-        col("TRIGGER", run.trigger ?? "—"),
-        col(
-          "HISTORY",
-          `${historyRunCount} run${historyRunCount !== 1 ? "s" : ""} compared`,
-        ),
-      ),
-    ],
-  });
 
   // --- Section 2: Analysis summary ---
   const failHtml =
