@@ -92,6 +92,14 @@ export const SCENARIOS: ScenarioDef[] = [
         higherIsBetter: false,
       },
       {
+        name: "backup-create-latency-5gb",
+        label: "Create",
+        kind: "latency",
+        group: "create",
+        size: "5GB",
+        higherIsBetter: false,
+      },
+      {
         name: "backup-restore-latency-100mb",
         label: "Restore",
         kind: "latency",
@@ -113,6 +121,14 @@ export const SCENARIOS: ScenarioDef[] = [
         kind: "latency",
         group: "restore",
         size: "1GB",
+        higherIsBetter: false,
+      },
+      {
+        name: "backup-restore-latency-5gb",
+        label: "Restore",
+        kind: "latency",
+        group: "restore",
+        size: "5GB",
         higherIsBetter: false,
       },
       {
