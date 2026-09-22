@@ -4,6 +4,8 @@
 
 BenchBox ingests benchmark run results, stores them in a Cloudflare D1 database, and surfaces regressions, trends, and AI-generated insights through a React dashboard. When something looks off, it also dispatches a `SandboxSDKInvestigator` agent that inspects the relevant SDK code changes and posts a diagnosis to Google Chat.
 
+<img width="448" height="234" alt="Screenshot 2026-09-22 at 15 00 35" src="https://github.com/user-attachments/assets/3ffbfc82-8e7d-480d-9520-98b984bec922" />
+
 ---
 
 ## What it does
